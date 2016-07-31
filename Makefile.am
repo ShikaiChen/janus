@@ -123,7 +123,7 @@ janus_LDADD = \
 	$(BORINGSSL_LIBS) \
 	$(JANUS_LIBS) \
 	$(JANUS_MANUAL_LIBS) \
-	-lsrtp \
+	-lavdevice -lavfilter -lavformat -lavcodec -lswscale -lavutil -lm \
 	$(NULL)
 
 BUILT_SOURCES = cmdline.c cmdline.h
@@ -200,7 +200,7 @@ plugins_cflags = \
 
 plugins_libadd = \
 	$(PLUGINS_LIBS) \
-	-lavformat -lavcodec -lavutil -lm \
+	-lavdevice -lavfilter -lavformat -lavcodec -lswscale -lavutil -lm \
 	$(NULL)
 
 if ENABLE_PLUGIN_AUDIOBRIDGE
@@ -339,7 +339,7 @@ janus_pp_rec_CFLAGS = \
 
 janus_pp_rec_LDADD = \
 	$(POST_PROCESSING_LIBS) \
-	-lavformat -lavcodec -lavutil -lm \
+	-lavdevice -lavfilter -lavformat -lavcodec -lswscale -lavutil -lm \
 	$(NULL)
 endif
 
