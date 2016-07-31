@@ -112,7 +112,8 @@
 #define JANUS_ECHOTEST_NAME				"JANUS EchoTest plugin"
 #define JANUS_ECHOTEST_AUTHOR			"Meetecho s.r.l."
 #define JANUS_ECHOTEST_PACKAGE			"janus.plugin.echotest"
-
+#define av_frame_alloc  avcodec_alloc_frame
+#define av_frame_free avcodec_free_frame
 typedef struct janus_echotest_rtp_packet
 {
 	char* data;
@@ -124,6 +125,7 @@ typedef struct janus_echotest_incoming_pp
 	GList * data;
 	janus_mutex mutex;
 	gint fir_seq; 
+	gint alive;
 	int need_keyframe; 
 } janus_echotest_incoming_pp;
 
@@ -250,7 +252,6 @@ static volatile gint initialized = 0, stopping = 0;
 static janus_callbacks *gateway = NULL;
 static GThread *handler_thread;
 static GThread *watchdog;
-static GThread *pp_thread;
 static void *janus_echotest_handler(void *data);
 
 typedef struct janus_echotest_message {
@@ -279,6 +280,7 @@ typedef struct janus_echotest_session {
 	guint16 slowlink_count;
 	volatile gint hangingup;
 	gint64 destroyed;	/* Time at which this session was marked as destroyed */
+	GThread *pp_thread;
 } janus_echotest_session;
 static GHashTable *sessions;
 static GList *old_sessions;
@@ -317,7 +319,7 @@ void *janus_echotest_watchdog(void *data) {
 	while(g_atomic_int_get(&initialized) && !g_atomic_int_get(&stopping)) {
 		janus_mutex_lock(&sessions_mutex);
 		/* Iterate on all the sessions */
-		now = janus_get_monotonic_time();
+		now = janus_get_real_time();
 		if(old_sessions != NULL) {
 			GList *sl = old_sessions;
 			JANUS_LOG(LOG_HUGE, "Checking %d old EchoTest sessions...\n", g_list_length(old_sessions));
@@ -474,15 +476,16 @@ void janus_echotest_create_session(janus_plugin_session *handle, int *error) {
 	session->audio_active = TRUE;
 	session->video_active = TRUE;
 	janus_mutex_init(&session->rec_mutex);
+	
 	session->bitrate = 0;	/* No limit */
 	session->destroyed = 0;
 
-	session->pp_data = malloc(sizeof(janus_echotest_incoming_pp));
+	session->pp_data = g_malloc0(sizeof(janus_echotest_incoming_pp));
 	session->pp_data->data = NULL;
 	janus_mutex_init(&session->pp_data->mutex);
-	pp_thread = g_thread_new("postprocess thread", &janus_echotest_postprocess,session->pp_data);
+	session->pp_thread = g_thread_new("postprocess thread", &janus_echotest_postprocess,session->pp_data);
 
-
+	g_atomic_int_set(&session->pp_data->alive, 1);
 	g_atomic_int_set(&session->hangingup, 0);
 	handle->plugin_handle = session;
 	janus_mutex_lock(&sessions_mutex);
@@ -505,8 +508,14 @@ void janus_echotest_destroy_session(janus_plugin_session *handle, int *error) {
 	}
 	JANUS_LOG(LOG_VERB, "Removing Echo Test session...\n");
 	janus_mutex_lock(&sessions_mutex);
+	g_atomic_int_set(&session->pp_data->alive, 0);
+	if(session->pp_thread != NULL) {
+		g_thread_join(session->pp_thread);
+		handler_thread = NULL;
+	}
+	g_list_free(session->pp_data);
 	if(!session->destroyed) {
-		session->destroyed = janus_get_monotonic_time();
+		session->destroyed = janus_get_real_time();
 		g_hash_table_remove(sessions, handle);
 		/* Cleaning up and removing the session is done in a lazy way */
 		old_sessions = g_list_append(old_sessions, session);
@@ -595,7 +604,7 @@ void janus_echotest_incoming_rtp(janus_plugin_session *handle, int video, char *
 		}
 		if(session->destroyed)
 			return;
-		if((!video && session->audio_active) || (video && session->video_active)) {
+		if(session->pp_data->alive && (!video && session->audio_active) || (video && session->video_active)) {
 			janus_echotest_incoming_pp * entry = session->pp_data;
 
 			janus_mutex_lock(&entry->mutex); 
@@ -968,10 +977,10 @@ static void *janus_echotest_handler(void *data) {
 			}
 			/* How long will the gateway take to push the event? */
 			g_atomic_int_set(&session->hangingup, 0);
-			gint64 start = janus_get_monotonic_time();
+			gint64 start = janus_get_real_time();
 			int res = gateway->push_event(msg->handle, &janus_echotest_plugin, msg->transaction, event_text, type, sdp);
 			JANUS_LOG(LOG_VERB, "  >> Pushing event: %d (took %"SCNu64" us)\n",
-				res, janus_get_monotonic_time()-start);
+				res, janus_get_real_time()-start);
 			g_free(sdp);
 		}
 		g_free(event_text);
@@ -1178,9 +1187,9 @@ static void * janus_echotest_postprocess(void * data)
 	tmp = g_list_first(userdata->data );
 	janus_mutex_unlock(&userdata->mutex);   
 	unsigned long waiting = 0; 
-	int alive = 1; 
+	 
 	
-	while(!g_atomic_int_get(&stopping) && alive)
+	while(!g_atomic_int_get(&stopping) && g_atomic_int_get(&userdata->alive))
 	{
 		janus_mutex_lock(&userdata->mutex); 
 		start = g_list_first(userdata->data );
@@ -1198,6 +1207,7 @@ static void * janus_echotest_postprocess(void * data)
 		
 		if(!tmp && (key_search > 120) )
 		{
+			JANUS_LOG(LOG_INFO, "[postprocess] need a key frame! \n");
 			// ask the main thread to send FIR/PLI -> need a key frame. 
 			janus_mutex_lock(&userdata->mutex); 
 			userdata->need_keyframe = 1; 
@@ -1231,7 +1241,6 @@ static void * janus_echotest_postprocess(void * data)
 		continue; 
 		
 	delete_and_continue :	
-		
 		janus_mutex_lock(&userdata->mutex); 
 		GList * delete = tmp; 
 		janus_echotest_rtp_packet * delete_rtp = (janus_echotest_rtp_packet * ) delete->data;
@@ -1273,6 +1282,7 @@ static void * janus_echotest_postprocess(void * data)
 		// handle reset
 		if (((cur_seq_number - ntohs(rtp->seq_number) > 10000)) && tmp)
 		{
+			JANUS_LOG(LOG_INFO, "[postprocess] reset! \n");
 			//reset
 			//JANUS_LOG(LOG_ERR, "RESET in RTP seq_number current : %"SCNu32" packet %"SCNu16"\n",cur_seq_number,ntohs(rtp->seq_number) );
 			reset_search_min_seq = 1; 
@@ -1300,7 +1310,7 @@ static void * janus_echotest_postprocess(void * data)
 		//// end handle reset
 		
 		if(ntohs(rtp->seq_number) != (cur_seq_number+1))
-		{	  
+		{	 
 			// Packet not folowing 
 			if(ntohs(rtp->seq_number) < cur_seq_number)
 				goto delete_and_continue; 
@@ -1325,7 +1335,7 @@ static void * janus_echotest_postprocess(void * data)
 		else
 		{
 			// packet is the next one 
-		
+	
 			cur_seq_number = ntohs(rtp->seq_number); 
 			nb_search = 0; 
 			
@@ -1407,7 +1417,6 @@ static void * janus_echotest_postprocess(void * data)
 				m_pCodecCtx->height = vp8h; 
 				m_pCodecCtx->pix_fmt = AV_PIX_FMT_YUV420P;
 				m_pCodecCtx->flags |= CODEC_FLAG_GLOBAL_HEADER;
-				
 				avcodec_open2(m_pCodecCtx,m_pCodec,0);
 				if(!m_pFrame)
 					m_pFrame = av_frame_alloc()	;
@@ -1426,7 +1435,6 @@ static void * janus_echotest_postprocess(void * data)
 			av_free_packet(&vpacket); 
 			
 	check_decode_process : 
-	
 			if(nres < 0 )
 			{
 				JANUS_LOG(LOG_ERR, "Decoder BROKEN ->> !!! \n");
