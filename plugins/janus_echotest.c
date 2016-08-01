@@ -105,7 +105,15 @@
 #include <libavutil/imgutils.h>
 #include <libavutil/mathematics.h>
 #include <libavutil/samplefmt.h>
+#include "opencv2/core/core_c.h"
 /* Plugin information */
+ #include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <math.h>
+#include <time.h>
+#include <sys/time.h>
+#include <fcntl.h>
 #define JANUS_ECHOTEST_VERSION			6
 #define JANUS_ECHOTEST_VERSION_STRING	"0.0.6"
 #define JANUS_ECHOTEST_DESCRIPTION		"This is a trivial EchoTest plugin for Janus, just used to showcase the plugin interface."
@@ -637,7 +645,7 @@ void janus_echotest_incoming_rtp(janus_plugin_session *handle, int video, char *
 			}
 			janus_mutex_unlock(&entry->mutex); 
 			/* Send the frame back */
-			gateway->relay_rtp(handle, video, buf, len);
+			// gateway->relay_rtp(handle, video, buf, len);
 		}
 	}
 }
@@ -1088,6 +1096,59 @@ void janus_echotest_get_vp8info(char * offset,int len,janus_vp8_infos * infos)
 		infos->len = len; 
 		infos->offset = (char *) buf_ptr;  
 }
+void zpad(char* buffer, int n){
+    int len = strlen(buffer);
+    int i;
+    for(i = 0; i < len; ++ i){
+        buffer[n-i-1] = buffer[len - i - 1];
+    }
+    for(i = 0; i < n - len; ++ i){
+        buffer[i] = '0';
+    }
+    buffer[n] = '\0';
+}
+void sendAndGet(char* go, char* back)
+{
+    int sockfd, portno, n; 
+    struct sockaddr_in serv_addr; 
+    struct timeval timeout;
+    int blockSize = 100000;
+    char flag[10];
+    char buffer[100000];
+    int len = 518400;
+    timeout.tv_sec=0;
+    timeout.tv_usec=50*1000;
+    sockfd = socket(AF_INET , SOCK_STREAM , 0);
+    if (sockfd == -1)
+    {
+        JANUS_LOG(LOG_ERR,"ERROR: Could not create socket\n");
+    }
+    serv_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+    serv_addr.sin_family = AF_INET;
+    serv_addr.sin_port = htons( 1912 );
+    portno = 1912;
+    serv_addr.sin_port = htons(portno);
+    if (connect(sockfd,(struct sockaddr *) &serv_addr,sizeof(serv_addr)) < 0) 
+    {
+    	close(sockfd);
+        JANUS_LOG(LOG_ERR,"ERROR ON CONNECTING!\n");
+        return;
+    }
+    int fd = open("/dev/shm/I_LOVE_CS",O_RDWR | O_CREAT, S_IRWXG | S_IRWXU | S_IRWXO);
+    write(fd,go,518400);
+    close(fd);
+    n = write(sockfd,"y",1);
+    n = read(sockfd,flag,1);
+    if(flag[0] != 'y'){
+    	JANUS_LOG(LOG_ERR, "ERROR: YOLO IS NOT LISTENNING TO ME!\n");
+    	close(sockfd);
+    	return;
+    }
+   	fd = open("/dev/shm/ME_TOO",O_RDWR);
+    read(fd,back,518400);
+    close(fd);
+    close(sockfd); 
+}
 static void * janus_echotest_postprocess(void * data)
 {
 				
@@ -1142,9 +1203,9 @@ static void * janus_echotest_postprocess(void * data)
 	
 	vStream->codec->codec_id = AV_CODEC_ID_VP8;
 	vStream->codec->codec_type = AVMEDIA_TYPE_VIDEO;
-	vStream->codec->time_base = (AVRational){1, 30};
-	vStream->codec->width = 640;
-	vStream->codec->height = 480;
+	vStream->codec->time_base = (AVRational){1, 100};
+	vStream->codec->width = 480;
+	vStream->codec->height = 360;
 	vStream->codec->pix_fmt = AV_PIX_FMT_YUV420P;
 	vStream->codec->bit_rate = 256000; 
 	vStream->codec->slices       = 8;
@@ -1187,18 +1248,19 @@ static void * janus_echotest_postprocess(void * data)
 	tmp = g_list_first(userdata->data );
 	janus_mutex_unlock(&userdata->mutex);   
 	unsigned long waiting = 0; 
-	 
+	 int i = 0;
 	
-	while(!g_atomic_int_get(&stopping) && g_atomic_int_get(&userdata->alive))
+	// while(!g_atomic_int_get(&stopping) && g_atomic_int_get(&userdata->alive))
+	while(!stopping && userdata->alive)
 	{
-		janus_mutex_lock(&userdata->mutex); 
+		// janus_mutex_lock(&userdata->mutex); 
 		start = g_list_first(userdata->data );
-		janus_mutex_unlock(&userdata->mutex);   
+		// janus_mutex_unlock(&userdata->mutex);   
 		key_frame = 0; 
 		
 		if(!start) // Empty packet list -> wait 
 		{
-			usleep(2000); 
+			// usleep(1000); 
 			waiting++; 
 			continue; 
 		}
@@ -1213,7 +1275,7 @@ static void * janus_echotest_postprocess(void * data)
 			userdata->need_keyframe = 1; 
 			janus_mutex_unlock(&userdata->mutex); 
 			key_search = 0; 
-			usleep(25000); 
+			// usleep(500); 
 			//JANUS_LOG(LOG_ERR, "Waiting for the first key frame !!! \n");
 		}
 		
@@ -1233,9 +1295,9 @@ static void * janus_echotest_postprocess(void * data)
 			goto delete_and_continue; 
 		}
 		
-		janus_mutex_lock(&userdata->mutex); 
+		// janus_mutex_lock(&userdata->mutex); 
 		tmp = g_list_first(userdata->data );
-		janus_mutex_unlock(&userdata->mutex); 
+		// janus_mutex_unlock(&userdata->mutex); 
 		
 				
 		continue; 
@@ -1412,7 +1474,7 @@ static void * janus_echotest_postprocess(void * data)
 					avcodec_get_context_defaults2(m_pCodecCtx, AVMEDIA_TYPE_VIDEO);
 				#endif				
 				m_pCodecCtx->codec_type = AVMEDIA_TYPE_VIDEO;
-				m_pCodecCtx->time_base = (AVRational){1, 60};
+				m_pCodecCtx->time_base = (AVRational){1, 100};
 				m_pCodecCtx->width = vp8w;
 				m_pCodecCtx->height = vp8h; 
 				m_pCodecCtx->pix_fmt = AV_PIX_FMT_YUV420P;
@@ -1425,8 +1487,8 @@ static void * janus_echotest_postprocess(void * data)
 				if(!my_frame)
 					my_frame = av_frame_alloc();
 					 
-				resize = sws_getContext(640,480, PIX_FMT_RGB24, 640, 480, AV_PIX_FMT_YUV420P, SWS_BICUBIC, NULL, NULL, NULL);
-				myResize = sws_getContext(vp8w,vp8h, AV_PIX_FMT_YUV420P, 640, 480, PIX_FMT_RGB24, SWS_BICUBIC, NULL, NULL, NULL); 
+				resize = sws_getContext(480,360, PIX_FMT_RGB24, 480, 360, AV_PIX_FMT_YUV420P, SWS_BICUBIC, NULL, NULL, NULL);
+				myResize = sws_getContext(vp8w,vp8h, AV_PIX_FMT_YUV420P, 480, 360, PIX_FMT_RGB24, SWS_BICUBIC, NULL, NULL, NULL); 
 				reinit_decoder = 0; 
 			}
 			
@@ -1471,19 +1533,18 @@ static void * janus_echotest_postprocess(void * data)
 			
 			
 			// complete frame decoded -> rescale 
-			avpicture_fill((AVPicture*) my_frame, myFrame, PIX_FMT_RGB24, 640, 480);
+			avpicture_fill((AVPicture*) my_frame, myFrame, PIX_FMT_RGB24, 480, 360);
 			sws_frame->format = PIX_FMT_RGB24; 
-			sws_frame->height = 640; 
-			sws_frame->width = 480; 			 
-			avpicture_fill((AVPicture*) sws_frame, compFrame, AV_PIX_FMT_YUV420P, 640, 480);
+			sws_frame->height = 480; 
+			sws_frame->width = 360; 			 
+			avpicture_fill((AVPicture*) sws_frame, compFrame, AV_PIX_FMT_YUV420P, 480, 360);
 			sws_frame->format = AV_PIX_FMT_YUV420P; 
-			sws_frame->height = 640; 
-			sws_frame->width = 480; 
+			sws_frame->height = 480; 
+			sws_frame->width = 360; 
 			sws_scale(myResize, (const uint8_t *const *)(m_pFrame->data), m_pFrame->linesize, 0, vp8h, my_frame->data, my_frame->linesize);
-			
-			// HERE YOU HAVE YOUR RAW FRAME,  
-			// If you need it in another format like RGB24, scale it first to RGB, then rescale it to YUV420P
-			
+			// JANUS_LOG(LOG_INFO,"height: %d \t width: %d \t linesize: %d \n",my_frame->height, my_frame->width, my_frame->linesize[0]);
+			// char buffer[1440 * 360];
+			sendAndGet(my_frame->data[0], my_frame->data[0]);
 			// ... here make your frame manipulation, opencv ...  
 			sws_scale(resize, (const uint8_t *const *)(my_frame->data), my_frame->linesize, 0, vp8h, sws_frame->data, sws_frame->linesize);
 			// we encode it ...
