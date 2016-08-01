@@ -1,7 +1,8 @@
 cmdline.c
 cmdline.h
 docs/html/
-
+core
+run.sh
 /janus
 /janus-pp-rec
 /plugins/*.so

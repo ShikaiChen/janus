@@ -131,9 +131,12 @@ typedef struct janus_echotest_rtp_packet
 typedef struct janus_echotest_incoming_pp 
 {
 	GList * data;
+	gint fir_seq;
 	janus_mutex mutex;
-	gint fir_seq; 
 	gint alive;
+	gint64 remb_startup;/* Incremental changes on REMB to reach the target at startup */
+	gint64 remb_latest;	/* Time of latest sent REMB (to avoid flooding) */
+	gint64 fir_latest;
 	int need_keyframe; 
 } janus_echotest_incoming_pp;
 
@@ -150,9 +153,6 @@ typedef struct janus_vp8_infos
 	int len;
 	char* offset;
 } janus_vp8_infos;
-GHashTable * pp_publishers = NULL; 
-janus_mutex pp_publishers_mutex;
-
 typedef struct janus_pp_rtp_header
 {
 #if __BYTE_ORDER == __BIG_ENDIAN
@@ -260,6 +260,7 @@ static volatile gint initialized = 0, stopping = 0;
 static janus_callbacks *gateway = NULL;
 static GThread *handler_thread;
 static GThread *watchdog;
+static GThread *pp_thread;
 static void *janus_echotest_handler(void *data);
 
 typedef struct janus_echotest_message {
@@ -274,10 +275,10 @@ static janus_echotest_message exit_message;
 
 typedef struct janus_echotest_session {
 	janus_plugin_session *handle;
-	janus_echotest_incoming_pp* pp_data;
 	gboolean has_audio;
 	gboolean has_video;
 	gboolean has_data;
+	gint pp_access;
 	gboolean audio_active;
 	gboolean video_active;
 	uint64_t bitrate;
@@ -288,11 +289,13 @@ typedef struct janus_echotest_session {
 	guint16 slowlink_count;
 	volatile gint hangingup;
 	gint64 destroyed;	/* Time at which this session was marked as destroyed */
-	GThread *pp_thread;
 } janus_echotest_session;
 static GHashTable *sessions;
 static GList *old_sessions;
+static janus_mutex pp_mutex;
 static janus_mutex sessions_mutex;
+static gint pp_free;
+static janus_echotest_incoming_pp* pp_data;
 
 static void janus_echotest_message_free(janus_echotest_message *msg) {
 	if(!msg || msg == &exit_message)
@@ -371,6 +374,7 @@ int janus_echotest_init(janus_callbacks *callback, const char *config_path) {
 	}
 
 	/* Read configuration */
+	
 	char filename[255];
 	g_snprintf(filename, 255, "%s/%s.cfg", config_path, JANUS_ECHOTEST_PACKAGE);
 	JANUS_LOG(LOG_VERB, "Configuration file: %s\n", filename);
@@ -382,6 +386,7 @@ int janus_echotest_init(janus_callbacks *callback, const char *config_path) {
 	config = NULL;
 	
 	sessions = g_hash_table_new(NULL, NULL);
+	janus_mutex_init(&pp_mutex);
 	janus_mutex_init(&sessions_mutex);
 	messages = g_async_queue_new_full((GDestroyNotify) janus_echotest_message_free);
 	/* This is the callback we'll need to invoke to contact the gateway */
@@ -403,8 +408,12 @@ int janus_echotest_init(janus_callbacks *callback, const char *config_path) {
 		JANUS_LOG(LOG_ERR, "Got error %d (%s) trying to launch the EchoTest handler thread...\n", error->code, error->message ? error->message : "??");
 		return -1;
 	}
-	pp_publishers = g_hash_table_new(NULL, NULL);
-	janus_mutex_init(&pp_publishers_mutex); 
+	g_atomic_int_set(&pp_free, 1);
+	pp_data = g_malloc0(sizeof(janus_echotest_incoming_pp));
+	pp_data->data = NULL;
+	janus_mutex_init(&pp_data->mutex);
+	g_atomic_int_set(&pp_data->alive, 0);
+	pp_thread = g_thread_new("postprocess thread", &janus_echotest_postprocess,pp_data);
 	JANUS_LOG(LOG_INFO, "%s initialized!\n", JANUS_ECHOTEST_NAME);
 	return 0;
 }
@@ -425,6 +434,14 @@ void janus_echotest_destroy(void) {
 	}
 
 	/* FIXME We should destroy the sessions cleanly */
+
+	g_atomic_int_set(&pp_data->alive, 0);
+	if(pp_thread != NULL) {
+		g_thread_join(pp_thread);
+		handler_thread = NULL;
+	}
+	g_list_free(pp_data);
+
 	janus_mutex_lock(&sessions_mutex);
 	g_hash_table_destroy(sessions);
 	janus_mutex_unlock(&sessions_mutex);
@@ -487,19 +504,19 @@ void janus_echotest_create_session(janus_plugin_session *handle, int *error) {
 	
 	session->bitrate = 0;	/* No limit */
 	session->destroyed = 0;
-
-	session->pp_data = g_malloc0(sizeof(janus_echotest_incoming_pp));
-	session->pp_data->data = NULL;
-	janus_mutex_init(&session->pp_data->mutex);
-	session->pp_thread = g_thread_new("postprocess thread", &janus_echotest_postprocess,session->pp_data);
-
-	g_atomic_int_set(&session->pp_data->alive, 1);
+	janus_mutex_lock(&pp_mutex);
+	if(g_atomic_int_get(&pp_free)) g_atomic_int_set(&pp_free,0);
+	g_atomic_int_set(&session->pp_access, 1);
+	g_atomic_int_set(&pp_data->alive, 1);
+	JANUS_LOG(LOG_ERR, "pp get OK!\n");
+	janus_mutex_unlock(&pp_mutex);
+	
 	g_atomic_int_set(&session->hangingup, 0);
 	handle->plugin_handle = session;
 	janus_mutex_lock(&sessions_mutex);
 	g_hash_table_insert(sessions, handle, session);
 	janus_mutex_unlock(&sessions_mutex);
-
+	JANUS_LOG(LOG_ERR, "ss get OK!\n");
 	return;
 }
 
@@ -516,12 +533,14 @@ void janus_echotest_destroy_session(janus_plugin_session *handle, int *error) {
 	}
 	JANUS_LOG(LOG_VERB, "Removing Echo Test session...\n");
 	janus_mutex_lock(&sessions_mutex);
-	g_atomic_int_set(&session->pp_data->alive, 0);
-	if(session->pp_thread != NULL) {
-		g_thread_join(session->pp_thread);
-		handler_thread = NULL;
-	}
-	g_list_free(session->pp_data);
+
+	janus_mutex_lock(&pp_mutex);
+	if(g_atomic_int_get(&session->pp_access)) g_atomic_int_set(&pp_free,1);
+	g_list_free(&pp_data->data); 
+	g_atomic_int_set(&pp_data->alive,0);
+	JANUS_LOG(LOG_ERR, "pp rmv OK!\n");
+	janus_mutex_unlock(&pp_mutex);
+
 	if(!session->destroyed) {
 		session->destroyed = janus_get_real_time();
 		g_hash_table_remove(sessions, handle);
@@ -529,7 +548,7 @@ void janus_echotest_destroy_session(janus_plugin_session *handle, int *error) {
 		old_sessions = g_list_append(old_sessions, session);
 	}
 
-	g_list_free(session->pp_data);
+	
 	janus_mutex_unlock(&sessions_mutex);
 	return;
 }
@@ -603,6 +622,7 @@ void janus_echotest_incoming_rtp(janus_plugin_session *handle, int video, char *
 	if(handle == NULL || handle->stopped || g_atomic_int_get(&stopping) || !g_atomic_int_get(&initialized))
 		return;
 	/* Simple echo test */
+	janus_echotest_incoming_pp * entry = pp_data;
 	if(gateway) {
 		/* Honour the audio/video active flags */
 		janus_echotest_session *session = (janus_echotest_session *)handle->plugin_handle;	
@@ -612,8 +632,8 @@ void janus_echotest_incoming_rtp(janus_plugin_session *handle, int video, char *
 		}
 		if(session->destroyed)
 			return;
-		if(session->pp_data->alive && (!video && session->audio_active) || (video && session->video_active)) {
-			janus_echotest_incoming_pp * entry = session->pp_data;
+		if(session->pp_access && (!video && session->audio_active) || (video && session->video_active)) {
+			
 
 			janus_mutex_lock(&entry->mutex); 
 			unsigned char * vp8_h = (unsigned char *)(buf+19) ;
@@ -649,6 +669,7 @@ void janus_echotest_incoming_rtp(janus_plugin_session *handle, int video, char *
 		}
 	}
 }
+
 
 void janus_echotest_incoming_rtcp(janus_plugin_session *handle, int video, char *buf, int len) {
 	if(handle == NULL || handle->stopped || g_atomic_int_get(&stopping) || !g_atomic_int_get(&initialized))
@@ -1149,6 +1170,10 @@ void sendAndGet(char* go, char* back)
     close(fd);
     close(sockfd); 
 }
+
+
+
+
 static void * janus_echotest_postprocess(void * data)
 {
 				
@@ -1248,11 +1273,15 @@ static void * janus_echotest_postprocess(void * data)
 	tmp = g_list_first(userdata->data );
 	janus_mutex_unlock(&userdata->mutex);   
 	unsigned long waiting = 0; 
-	 int i = 0;
+	int i = 0;
 	
-	// while(!g_atomic_int_get(&stopping) && g_atomic_int_get(&userdata->alive))
-	while(!stopping && userdata->alive)
+	// // while(!g_atomic_int_get(&stopping) && g_atomic_int_get(&userdata->alive))
+	while(!g_atomic_int_get(&stopping))
 	{
+		if(g_atomic_int_get(&userdata->alive) == 0){
+			usleep(50000);
+			continue;
+		}
 		// janus_mutex_lock(&userdata->mutex); 
 		start = g_list_first(userdata->data );
 		// janus_mutex_unlock(&userdata->mutex);   
@@ -1260,7 +1289,7 @@ static void * janus_echotest_postprocess(void * data)
 		
 		if(!start) // Empty packet list -> wait 
 		{
-			// usleep(1000); 
+			usleep(50000); 
 			waiting++; 
 			continue; 
 		}
@@ -1275,10 +1304,10 @@ static void * janus_echotest_postprocess(void * data)
 			userdata->need_keyframe = 1; 
 			janus_mutex_unlock(&userdata->mutex); 
 			key_search = 0; 
-			// usleep(500); 
-			//JANUS_LOG(LOG_ERR, "Waiting for the first key frame !!! \n");
+			usleep(500); 
+			JANUS_LOG(LOG_ERR, "Waiting for the first key frame !!! \n");
 		}
-		
+
 		if (tmp) 
 		{
 			janus_echotest_rtp_packet * rtp_packet = (janus_echotest_rtp_packet * ) tmp->data; 
@@ -1294,15 +1323,16 @@ static void * janus_echotest_postprocess(void * data)
 			key_search++;
 			goto delete_and_continue; 
 		}
-		
-		// janus_mutex_lock(&userdata->mutex); 
+
+		janus_mutex_lock(&userdata->mutex); 
 		tmp = g_list_first(userdata->data );
-		// janus_mutex_unlock(&userdata->mutex); 
+		janus_mutex_unlock(&userdata->mutex); 
 		
 				
 		continue; 
 		
 	delete_and_continue :	
+
 		janus_mutex_lock(&userdata->mutex); 
 		GList * delete = tmp; 
 		janus_echotest_rtp_packet * delete_rtp = (janus_echotest_rtp_packet * ) delete->data;
@@ -1315,12 +1345,11 @@ static void * janus_echotest_postprocess(void * data)
 		continue; 
 
 	ccontinue : 		// useless, just to catch something (stats) with undeleted packets in a previous version of this code 
-		
+	;
 		continue;
 		
 	process_frame : 
 		; // label followed by declaration, not a statement so it wont compile without that empty statement. 
-		
 		janus_echotest_rtp_packet * rtp_packet = (janus_echotest_rtp_packet * ) tmp->data; 		
 		int skip = 0; 
 		memcpy(header_buf,rtp_packet->data,16);  
@@ -1341,36 +1370,6 @@ static void * janus_echotest_postprocess(void * data)
 			JANUS_LOG(LOG_INFO, "[postprocess] Key frame received setting current sequence to :%"SCNu16" \n",ntohs(rtp->seq_number)-1);
 		}
 				
-		// handle reset
-		if (((cur_seq_number - ntohs(rtp->seq_number) > 10000)) && tmp)
-		{
-			JANUS_LOG(LOG_INFO, "[postprocess] reset! \n");
-			//reset
-			//JANUS_LOG(LOG_ERR, "RESET in RTP seq_number current : %"SCNu32" packet %"SCNu16"\n",cur_seq_number,ntohs(rtp->seq_number) );
-			reset_search_min_seq = 1; 
-			cur_seq_number = ntohs(rtp->seq_number); 
-			goto ccontinue; 		
-		}
-		if(reset_search_min_seq)
-		{
-			if (ntohs(rtp->seq_number) < cur_seq_number )
-			{
-				//JANUS_LOG(LOG_ERR, "RESET min seq found  %"SCNu16"\n",ntohs(rtp->seq_number));
-				cur_seq_number = ntohs(rtp->seq_number);
-			}
-			janus_mutex_lock(&userdata->mutex); 
-			tmp = tmp->next; 
-			janus_mutex_unlock(&userdata->mutex); 
-			if(!tmp) // end of min seq number search 
-			{
-				reset_search_min_seq = 0;
-				cur_seq_number--;  
-				//JANUS_LOG(LOG_ERR, "RESET end of min seq search\n"); 
-			} 
-			goto ccontinue;			
-		}
-		//// end handle reset
-		
 		if(ntohs(rtp->seq_number) != (cur_seq_number+1))
 		{	 
 			// Packet not folowing 
@@ -1580,17 +1579,12 @@ static void * janus_echotest_postprocess(void * data)
 			goto delete_and_continue; 
 		}		 
 	}
-	
-	janus_mutex_lock(&userdata->mutex);
-	g_list_free(userdata->data); 
-	janus_mutex_unlock(&userdata->mutex); 
-	janus_mutex_destroy(&userdata->mutex); 
-	g_free(userdata); 
 	g_free(compFrame);
 	g_free(myFrame);
 	g_free(received_frame); 
 	g_free(infos); 
-	JANUS_LOG(LOG_INFO, "Leaving POSTPROCESS thread	\n");
+
+	JANUS_LOG(LOG_ERR, "pp cls OK!\n");
 	
 	return NULL;
 	 
