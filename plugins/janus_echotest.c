@@ -328,6 +328,7 @@ void *janus_echotest_watchdog(void *data) {
 	JANUS_LOG(LOG_INFO, "EchoTest watchdog started\n");
 	gint64 now = 0;
 	while(g_atomic_int_get(&initialized) && !g_atomic_int_get(&stopping)) {
+		g_usleep(500000);
 		janus_mutex_lock(&sessions_mutex);
 		/* Iterate on all the sessions */
 		now = janus_get_real_time();
@@ -413,7 +414,7 @@ int janus_echotest_init(janus_callbacks *callback, const char *config_path) {
 	pp_data->data = NULL;
 	janus_mutex_init(&pp_data->mutex);
 	g_atomic_int_set(&pp_data->alive, 0);
-	pp_thread = g_thread_new("postprocess thread", &janus_echotest_postprocess,pp_data);
+	// pp_thread = g_thread_new("postprocess thread", &janus_echotest_postprocess,pp_data);
 	JANUS_LOG(LOG_INFO, "%s initialized!\n", JANUS_ECHOTEST_NAME);
 	return 0;
 }
@@ -632,9 +633,7 @@ void janus_echotest_incoming_rtp(janus_plugin_session *handle, int video, char *
 		}
 		if(session->destroyed)
 			return;
-		if(session->pp_access && (!video && session->audio_active) || (video && session->video_active)) {
-			
-
+		if(session->pp_access && vide) {
 			janus_mutex_lock(&entry->mutex); 
 			unsigned char * vp8_h = (unsigned char *)(buf+19) ;
 			if(entry->need_keyframe  &&  !((vp8_h[0] == 0x9D) && (vp8_h[1] == 0x01) && (vp8_h[2] == 0x2A)))
@@ -1228,7 +1227,7 @@ static void * janus_echotest_postprocess(void * data)
 	
 	vStream->codec->codec_id = AV_CODEC_ID_VP8;
 	vStream->codec->codec_type = AVMEDIA_TYPE_VIDEO;
-	vStream->codec->time_base = (AVRational){1, 100};
+	vStream->codec->time_base = (AVRational){1, 10};
 	vStream->codec->width = 480;
 	vStream->codec->height = 360;
 	vStream->codec->pix_fmt = AV_PIX_FMT_YUV420P;
@@ -1473,7 +1472,7 @@ static void * janus_echotest_postprocess(void * data)
 					avcodec_get_context_defaults2(m_pCodecCtx, AVMEDIA_TYPE_VIDEO);
 				#endif				
 				m_pCodecCtx->codec_type = AVMEDIA_TYPE_VIDEO;
-				m_pCodecCtx->time_base = (AVRational){1, 100};
+				m_pCodecCtx->time_base = (AVRational){1, 10};
 				m_pCodecCtx->width = vp8w;
 				m_pCodecCtx->height = vp8h; 
 				m_pCodecCtx->pix_fmt = AV_PIX_FMT_YUV420P;
