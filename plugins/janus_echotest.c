@@ -261,6 +261,9 @@ static janus_callbacks *gateway = NULL;
 static GThread *handler_thread;
 static GThread *watchdog;
 static GThread *pp_thread;
+static int sockfd1;
+static int sockfd2;
+static int stop = 0;
 static void *janus_echotest_handler(void *data);
 
 typedef struct janus_echotest_message {
@@ -414,7 +417,7 @@ int janus_echotest_init(janus_callbacks *callback, const char *config_path) {
 	pp_data->data = NULL;
 	janus_mutex_init(&pp_data->mutex);
 	g_atomic_int_set(&pp_data->alive, 0);
-	// pp_thread = g_thread_new("postprocess thread", &janus_echotest_postprocess,pp_data);
+	pp_thread = g_thread_new("postprocess thread", &janus_echotest_postprocess,pp_data);
 	JANUS_LOG(LOG_INFO, "%s initialized!\n", JANUS_ECHOTEST_NAME);
 	return 0;
 }
@@ -437,12 +440,8 @@ void janus_echotest_destroy(void) {
 	/* FIXME We should destroy the sessions cleanly */
 
 	g_atomic_int_set(&pp_data->alive, 0);
-	if(pp_thread != NULL) {
-		g_thread_join(pp_thread);
-		handler_thread = NULL;
-	}
-	g_list_free(pp_data);
-
+	g_list_free(&pp_data->data);
+	g_free(pp_data);
 	janus_mutex_lock(&sessions_mutex);
 	g_hash_table_destroy(sessions);
 	janus_mutex_unlock(&sessions_mutex);
@@ -506,9 +505,12 @@ void janus_echotest_create_session(janus_plugin_session *handle, int *error) {
 	session->bitrate = 0;	/* No limit */
 	session->destroyed = 0;
 	janus_mutex_lock(&pp_mutex);
-	if(g_atomic_int_get(&pp_free)) g_atomic_int_set(&pp_free,0);
-	g_atomic_int_set(&session->pp_access, 1);
-	g_atomic_int_set(&pp_data->alive, 1);
+	if(g_atomic_int_get(&pp_free)) 
+		{
+			g_atomic_int_set(&pp_free,0);
+			g_atomic_int_set(&session->pp_access, 1);
+			g_atomic_int_set(&pp_data->alive, 1);
+		}
 	JANUS_LOG(LOG_ERR, "pp get OK!\n");
 	janus_mutex_unlock(&pp_mutex);
 	
@@ -538,6 +540,7 @@ void janus_echotest_destroy_session(janus_plugin_session *handle, int *error) {
 	janus_mutex_lock(&pp_mutex);
 	if(g_atomic_int_get(&session->pp_access)) g_atomic_int_set(&pp_free,1);
 	g_list_free(&pp_data->data); 
+	pp_data->data = NULL; 
 	g_atomic_int_set(&pp_data->alive,0);
 	JANUS_LOG(LOG_ERR, "pp rmv OK!\n");
 	janus_mutex_unlock(&pp_mutex);
@@ -633,7 +636,7 @@ void janus_echotest_incoming_rtp(janus_plugin_session *handle, int video, char *
 		}
 		if(session->destroyed)
 			return;
-		if(session->pp_access && vide) {
+		if(session->pp_access && video) {
 			janus_mutex_lock(&entry->mutex); 
 			unsigned char * vp8_h = (unsigned char *)(buf+19) ;
 			if(entry->need_keyframe  &&  !((vp8_h[0] == 0x9D) && (vp8_h[1] == 0x01) && (vp8_h[2] == 0x2A)))
@@ -1127,47 +1130,49 @@ void zpad(char* buffer, int n){
     }
     buffer[n] = '\0';
 }
+static struct timeval tval_before1, tval_after1;
 void sendAndGet(char* go, char* back)
 {
-    int sockfd, portno, n; 
-    struct sockaddr_in serv_addr; 
-    struct timeval timeout;
+    struct timeval tval_result;
+    
+    
     int blockSize = 100000;
     char flag[10];
     char buffer[100000];
     int len = 518400;
-    timeout.tv_sec=0;
-    timeout.tv_usec=50*1000;
-    sockfd = socket(AF_INET , SOCK_STREAM , 0);
-    if (sockfd == -1)
-    {
-        JANUS_LOG(LOG_ERR,"ERROR: Could not create socket\n");
-    }
-    serv_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
-    serv_addr.sin_family = AF_INET;
-    serv_addr.sin_port = htons( 1912 );
-    portno = 1912;
-    serv_addr.sin_port = htons(portno);
-    if (connect(sockfd,(struct sockaddr *) &serv_addr,sizeof(serv_addr)) < 0) 
-    {
-    	close(sockfd);
-        JANUS_LOG(LOG_ERR,"ERROR ON CONNECTING!\n");
-        return;
-    }
+    int n, sum = 0;
+    
     int fd = open("/dev/shm/I_LOVE_CS",O_RDWR | O_CREAT, S_IRWXG | S_IRWXU | S_IRWXO);
-    write(fd,go,518400);
+    n =write(fd,go,518400);
     close(fd);
-    n = write(sockfd,"y",1);
-    n = read(sockfd,flag,1);
-    if(flag[0] != 'y'){
+    n = write(sockfd1,"y",1);
+    if(!n){
+    	JANUS_LOG(LOG_ERR, "janus write y failed!\n");
+    	return;
+    }
+    // JANUS_LOG(LOG_ERR, "janus write y\n");
+    n = read(sockfd2,flag,1);
+    if(!n){
+    	JANUS_LOG(LOG_ERR, "janus read y failed!\n");
+    	return;
+    }
+    // JANUS_LOG(LOG_ERR, "janus read %d %s!\n", n, flag);
+    if(flag[0] != 'y' &&  flag[0] != 'n'){
     	JANUS_LOG(LOG_ERR, "ERROR: YOLO IS NOT LISTENNING TO ME!\n");
-    	close(sockfd);
+    	return;
+    }
+    else if(flag[0] == 'n'){
+    	JANUS_LOG(LOG_ERR, "YOLO NEED A NEW FRAME!\n");
     	return;
     }
    	fd = open("/dev/shm/ME_TOO",O_RDWR);
-    read(fd,back,518400);
-    close(fd);
-    close(sockfd); 
+    n = read(fd,back,518400);
+    // JANUS_LOG(LOG_ERR, "janus read %d!\n", n);
+    close(fd); 
+ //    gettimeofday(&tval_before1,NULL);
+ //    gettimeofday(&tval_after1, NULL);
+ //    timersub(&tval_before1, &tval_after1, &tval_result);
+	// JANUS_LOG(LOG_ERR, "send and get time: %f\n",tval_result.tv_usec/1000.0);
 }
 
 
@@ -1227,11 +1232,11 @@ static void * janus_echotest_postprocess(void * data)
 	
 	vStream->codec->codec_id = AV_CODEC_ID_VP8;
 	vStream->codec->codec_type = AVMEDIA_TYPE_VIDEO;
-	vStream->codec->time_base = (AVRational){1, 10};
+	vStream->codec->time_base = (AVRational){1, 200};
 	vStream->codec->width = 480;
 	vStream->codec->height = 360;
 	vStream->codec->pix_fmt = AV_PIX_FMT_YUV420P;
-	vStream->codec->bit_rate = 256000; 
+	vStream->codec->bit_rate = 2048000; 
 	vStream->codec->slices       = 8;
 	//vStream->codec->profile      = 3;
 	vStream->codec->thread_count = 1;
@@ -1269,320 +1274,414 @@ static void * janus_echotest_postprocess(void * data)
 	int rtp_written = 0; 
 	int sframe_search = 0;
 	janus_mutex_lock(&userdata->mutex); 
-	tmp = g_list_first(userdata->data );
+	tmp = g_list_first(userdata->data);
 	janus_mutex_unlock(&userdata->mutex);   
 	unsigned long waiting = 0; 
 	int i = 0;
-	
+	struct timeval tval_before, tval_after, tval_result;
 	// // while(!g_atomic_int_get(&stopping) && g_atomic_int_get(&userdata->alive))
-	while(!g_atomic_int_get(&stopping))
-	{
-		if(g_atomic_int_get(&userdata->alive) == 0){
-			usleep(50000);
-			continue;
-		}
-		// janus_mutex_lock(&userdata->mutex); 
-		start = g_list_first(userdata->data );
-		// janus_mutex_unlock(&userdata->mutex);   
-		key_frame = 0; 
-		
-		if(!start) // Empty packet list -> wait 
-		{
-			usleep(50000); 
-			waiting++; 
-			continue; 
-		}
-		
-		if(first_frame && tmp) goto process_frame; 
-		
-		if(!tmp && (key_search > 120) )
-		{
-			JANUS_LOG(LOG_INFO, "[postprocess] need a key frame! \n");
-			// ask the main thread to send FIR/PLI -> need a key frame. 
-			janus_mutex_lock(&userdata->mutex); 
-			userdata->need_keyframe = 1; 
-			janus_mutex_unlock(&userdata->mutex); 
-			key_search = 0; 
-			usleep(500); 
-			JANUS_LOG(LOG_ERR, "Waiting for the first key frame !!! \n");
-		}
+	//socket
+	int n; 
+    struct sockaddr_in serv_addr1; 
+    struct sockaddr_in serv_addr2; 
+    sockfd1 = socket(AF_INET , SOCK_STREAM , 0);
+    if (sockfd1 == -1)
+    {
+        JANUS_LOG(LOG_ERR,"ERROR: Could not create socket1\n");
+    }
+    sockfd2 = socket(AF_INET , SOCK_STREAM , 0);
+    if (sockfd1 == -1)
+    {
+        JANUS_LOG(LOG_ERR,"ERROR: Could not create socket2\n");
+    }
+    serv_addr1.sin_addr.s_addr = inet_addr("127.0.0.1");
+    serv_addr1.sin_family = AF_INET;
+    serv_addr1.sin_port = htons( 1912 );
+    serv_addr2.sin_addr.s_addr = inet_addr("127.0.0.1");
+    serv_addr2.sin_family = AF_INET;
+    serv_addr2.sin_port = htons( 1913 );
+    while(1){
+	    if (connect(sockfd1,(struct sockaddr *) &serv_addr1,sizeof(serv_addr1)) < 0) 
+	    {
+	    	close(sockfd1);
+	        JANUS_LOG(LOG_ERR,"ERROR ON CONNECTING 1!\n");
+	        return;
+	    }
+	    if (connect(sockfd2,(struct sockaddr *) &serv_addr2,sizeof(serv_addr2)) < 0) 
+	    {
+	    	close(sockfd2);
+	        JANUS_LOG(LOG_ERR,"ERROR ON CONNECTING 2!\n");
+	        return;
+	    }
+	    
+	    //end socket
 
-		if (tmp) 
+		while(!g_atomic_int_get(&stopping))
 		{
-			janus_echotest_rtp_packet * rtp_packet = (janus_echotest_rtp_packet * ) tmp->data; 
-			unsigned char * vp8_h = (unsigned char * )(rtp_packet->data) + 19;	
-			if((vp8_h[0] == 0x9D) && (vp8_h[1] == 0x01) && (vp8_h[2] == 0x2A))
-			{
-				JANUS_LOG(LOG_INFO, "[postprocess] YEAH First key frame OK \n");
-				first_frame = 1;
-				key_search = 0; 
-				key_frame = 1; 
-				goto process_frame;  
+			// gettimeofday(&tval_before, NULL);
+			if(userdata->alive == 0){
+				tmp = NULL;
+				usleep(50000);
+				continue;
 			}
-			key_search++;
-			goto delete_and_continue; 
-		}
-
-		janus_mutex_lock(&userdata->mutex); 
-		tmp = g_list_first(userdata->data );
-		janus_mutex_unlock(&userdata->mutex); 
-		
-				
-		continue; 
-		
-	delete_and_continue :	
-
-		janus_mutex_lock(&userdata->mutex); 
-		GList * delete = tmp; 
-		janus_echotest_rtp_packet * delete_rtp = (janus_echotest_rtp_packet * ) delete->data;
-		g_free (delete_rtp->data);	
-		g_free (delete->data);
-		tmp = tmp->next; 			
-		userdata->data  = start = g_list_remove_link (start, delete);
-		g_list_free (delete);
-		janus_mutex_unlock(&userdata->mutex); 
-		continue; 
-
-	ccontinue : 		// useless, just to catch something (stats) with undeleted packets in a previous version of this code 
-	;
-		continue;
-		
-	process_frame : 
-		; // label followed by declaration, not a statement so it wont compile without that empty statement. 
-		janus_echotest_rtp_packet * rtp_packet = (janus_echotest_rtp_packet * ) tmp->data; 		
-		int skip = 0; 
-		memcpy(header_buf,rtp_packet->data,16);  
-		janus_pp_rtp_header * rtp = (janus_pp_rtp_header *) header_buf;
-		if(rtp->extension) 
-		{
-			janus_pp_rtp_header_extension *ext = (janus_pp_rtp_header_extension *)(header_buf+12);
-			skip = 4 + ntohs(ext->length)*4;
-		}
-		
-		char * offset = rtp_packet->data+12+skip;
-		int len = rtp_packet->len-12-skip; 
-		
-		if(key_frame)	// In the case we were searching a key_frame 
-		{
-			cur_seq_number = ntohs(rtp->seq_number)-1; 
-			was_key_frame = 1; 
-			JANUS_LOG(LOG_INFO, "[postprocess] Key frame received setting current sequence to :%"SCNu16" \n",ntohs(rtp->seq_number)-1);
-		}
-				
-		if(ntohs(rtp->seq_number) != (cur_seq_number+1))
-		{	 
-			// Packet not folowing 
-			if(ntohs(rtp->seq_number) < cur_seq_number)
-				goto delete_and_continue; 
-				
-			nb_search++; 
-			janus_mutex_lock(&userdata->mutex); 
-			tmp = tmp->next;
-			janus_mutex_unlock(&userdata->mutex); 
-			if(!tmp && (nb_search > 100))
+			// janus_mutex_lock(&userdata->mutex); 
+			start = g_list_first(userdata->data);
+			// janus_mutex_unlock(&userdata->mutex);   
+			key_frame = 0; 
+			
+			if(!start) // Empty packet list -> wait 
 			{
-			// will arrive too late, skip
-				JANUS_LOG(LOG_VERB, "[postprocess] packet too late -> skip \n");
-				cur_seq_number++;
-				tmp = start; 
-				frame_len = 0; 
-				nb_search = 0;
-				was_key_frame = 0;  
+				waiting++; 
+				continue; 
+			}
+			
+			if(first_frame && tmp) goto process_frame; 
+			
+			if(!tmp && (key_search > 120) )
+			{
+				// ask the main thread to send FIR/PLI -> need a key frame. 
+				janus_mutex_lock(&userdata->mutex); 
+				userdata->need_keyframe = 1; 
+				janus_mutex_unlock(&userdata->mutex); 
+				key_search = 0; 
+				JANUS_LOG(LOG_ERR, "Waiting for the first key frame !!! \n");
+			}
+
+			if (tmp) 
+			{
+				janus_echotest_rtp_packet * rtp_packet = (janus_echotest_rtp_packet * ) tmp->data; 
+				unsigned char * vp8_h = (unsigned char * )(rtp_packet->data) + 19;	
+				if((vp8_h[0] == 0x9D) && (vp8_h[1] == 0x01) && (vp8_h[2] == 0x2A))
+				{
+					JANUS_LOG(LOG_ERR, "[postprocess] YEAH First key frame OK \n");
+					first_frame = 1;
+					key_search = 0; 
+					key_frame = 1; 
+					goto process_frame;  
+				}
+				key_search++;
+				goto delete_and_continue; 
+			}
+
+			// janus_mutex_lock(&userdata->mutex); 
+			tmp = g_list_first(userdata->data);
+			// janus_mutex_unlock(&userdata->mutex); 
+			
+					
+			continue; 
+			
+		delete_and_continue :	
+
+			janus_mutex_lock(&userdata->mutex); 
+			GList * delete = tmp; 
+			janus_echotest_rtp_packet * delete_rtp = (janus_echotest_rtp_packet * ) delete->data;
+			g_free (delete_rtp->data);	
+			g_free (delete->data);
+			tmp = tmp->next; 			
+			userdata->data  = start = g_list_remove_link (start, delete);
+			g_list_free (delete);
+			janus_mutex_unlock(&userdata->mutex); 
+			continue; 
+
+		ccontinue : 		// useless, just to catch something (stats) with undeleted packets in a previous version of this code 
+		;
+			continue;
+			
+		process_frame : 
+			; // label followed by declaration, not a statement so it wont compile without that empty statement. 
+			// gettimeofday(&tval_before1,NULL);
+			janus_echotest_rtp_packet * rtp_packet = (janus_echotest_rtp_packet * ) tmp->data; 		
+			int skip = 0; 
+			memcpy(header_buf,rtp_packet->data,16);  
+			janus_pp_rtp_header * rtp = (janus_pp_rtp_header *) header_buf;
+			if(rtp->extension) 
+			{
+				janus_pp_rtp_header_extension *ext = (janus_pp_rtp_header_extension *)(header_buf+12);
+				skip = 4 + ntohs(ext->length)*4;
+			}
+			
+			char * offset = rtp_packet->data+12+skip;
+			int len = rtp_packet->len-12-skip; 
+			
+			if(key_frame)	// In the case we were searching a key_frame 
+			{
+				cur_seq_number = ntohs(rtp->seq_number)-1; 
+				was_key_frame = 1; 
+				JANUS_LOG(LOG_INFO, "[postprocess] Key frame received setting current sequence to :%"SCNu16" \n",ntohs(rtp->seq_number)-1);
+			}
+			// handle reset
+			if (((cur_seq_number - ntohs(rtp->seq_number) > 10000)) && tmp)
+			{
+				//reset
+				//JANUS_LOG(LOG_ERR, "RESET in RTP seq_number current : %"SCNu32" packet %"SCNu16"\n",cur_seq_number,ntohs(rtp->seq_number) );
+				reset_search_min_seq = 1 ; 
+				cur_seq_number = ntohs(rtp->seq_number) ; 
+				goto ccontinue ; 		
+			}
+			if(reset_search_min_seq)
+			{
+				if (ntohs(rtp->seq_number) < cur_seq_number )
+				{	
+					//JANUS_LOG(LOG_ERR, "RESET min seq found  %"SCNu16"\n",ntohs(rtp->seq_number));
+					cur_seq_number = ntohs(rtp->seq_number) ;
+				}
+				janus_mutex_lock(&userdata->mutex) ; 
+				tmp = tmp->next ; 
+				janus_mutex_unlock(&userdata->mutex) ; 
+				if(!tmp) // end of min seq number search 
+				{
+					reset_search_min_seq = 0 ;
+					cur_seq_number-- ;  
+					//JANUS_LOG(LOG_ERR, "RESET end of min seq search\n") ; 
+				} 
+				goto ccontinue ;			
+			}
+			//// end handle reset
+			if(ntohs(rtp->seq_number) != (cur_seq_number+1))
+			{	 
+				// Packet not folowing 
+				if(ntohs(rtp->seq_number) < cur_seq_number)
+					goto delete_and_continue; 
+					
+				nb_search++; 
+				janus_mutex_lock(&userdata->mutex); 
+				tmp = tmp->next;
+				janus_mutex_unlock(&userdata->mutex); 
+				if(!tmp && (nb_search > 100))
+				{
+				// will arrive too late, skip
+					JANUS_LOG(LOG_VERB, "[postprocess] packet too late -> skip \n");
+					cur_seq_number++;
+					tmp = start; 
+					frame_len = 0; 
+					nb_search = 0;
+					was_key_frame = 0;  
+					goto ccontinue; 
+				}
 				goto ccontinue; 
 			}
-			goto ccontinue; 
-		}
-		else
-		{
-			// packet is the next one 
-	
-			cur_seq_number = ntohs(rtp->seq_number); 
-			nb_search = 0; 
-			
-			janus_echotest_get_vp8info(offset,len,infos); 
-	
-			if(infos->key)
-				was_key_frame = 1; 
-			
-			if(sframe_search > 20) // FIXME : the good number 
+			else
 			{
-				JANUS_LOG(LOG_VERB, "sframe_search > 20 ...0_o \n");
-				was_key_frame = 0; 
-				sframe_search = 0; 
-				first_frame = 0; 
-				goto delete_and_continue; 
-			}
-			if(frame_len == 0 && !infos->sbit) 
-			{
-				JANUS_LOG(LOG_VERB, "frame_len = 0 and !infos->sbit 0_o \n");
-				sframe_search ++; 
-				goto delete_and_continue; 	
-			}
-			
-			if(infos->sbit && !infos->pid)
-				frame_len = 0; 
+				// packet is the next one 
 		
-			if((vp8w*vp8h+vp8ws*vp8hs) != ((infos->vp8w*infos->vp8h+infos->vp8ws*infos->vp8hs)))
-			{
-				vp8w  = infos->vp8w;
-				vp8ws = infos->vp8ws;
-				vp8h  = infos->vp8h;
-				vp8hs = infos->vp8hs;	
-				reinit_decoder = 1; 
-				JANUS_LOG(LOG_VERB, "[POSTPROCESS] resolution has changed !!!!!!!!! %d %d\n",vp8w,vp8h);			
-			}
-			
-			memcpy(received_frame+frame_len,infos->offset,infos->len); 
-			frame_len += infos->len; 
-			
-			if(!rtp->markerbit) // incomplete frame, continue.  
-				goto delete_and_continue;
-			
-			
-			// here, the frame is complete 
-			
-			memcpy(received_frame+frame_len,"00000000000000000000000000000000",32); // add padding for ffmpeg 
-			
-			AVPacket vpacket;
-			av_init_packet(&vpacket);
-			vpacket.stream_index = 0; 
-			vpacket.data = received_frame;
-			vpacket.size = frame_len;
-			vpacket.dts = (rtp->timestamp)/90;
-			vpacket.pts = (rtp->timestamp)/90;
-			
-			if(was_key_frame)
-				vpacket.flags |= AV_PKT_FLAG_KEY; 
-			
-			was_key_frame = 0; 
-			
-			if(reinit_decoder)
-			{
-				// i'm not sure that is needed. Maybe with older version of libav. 
-				// As the resolution change trigger a keyframe, the decoder should work. 
-				// the scaler need the original resolution too line 2817
+				cur_seq_number = ntohs(rtp->seq_number); 
+				nb_search = 0; 
 				
-				m_pCodec = avcodec_find_decoder(AV_CODEC_ID_VP8);	
-				m_pCodecCtx = avcodec_alloc_context3(m_pCodec);
-				m_pCodecCtx->codec_id = AV_CODEC_ID_VP8;
+				janus_echotest_get_vp8info(offset,len,infos); 
 		
-				#if LIBAVCODEC_VER_AT_LEAST(53, 21)
-					avcodec_get_context_defaults3(m_pCodecCtx, AVMEDIA_TYPE_VIDEO);
-				#else
-					avcodec_get_context_defaults2(m_pCodecCtx, AVMEDIA_TYPE_VIDEO);
-				#endif				
-				m_pCodecCtx->codec_type = AVMEDIA_TYPE_VIDEO;
-				m_pCodecCtx->time_base = (AVRational){1, 10};
-				m_pCodecCtx->width = vp8w;
-				m_pCodecCtx->height = vp8h; 
-				m_pCodecCtx->pix_fmt = AV_PIX_FMT_YUV420P;
-				m_pCodecCtx->flags |= CODEC_FLAG_GLOBAL_HEADER;
-				avcodec_open2(m_pCodecCtx,m_pCodec,0);
-				if(!m_pFrame)
-					m_pFrame = av_frame_alloc()	;
-				if(!sws_frame)
-					sws_frame = av_frame_alloc();
-				if(!my_frame)
-					my_frame = av_frame_alloc();
-					 
-				resize = sws_getContext(480,360, PIX_FMT_RGB24, 480, 360, AV_PIX_FMT_YUV420P, SWS_BICUBIC, NULL, NULL, NULL);
-				myResize = sws_getContext(vp8w,vp8h, AV_PIX_FMT_YUV420P, 480, 360, PIX_FMT_RGB24, SWS_BICUBIC, NULL, NULL, NULL); 
-				reinit_decoder = 0; 
-			}
-			
-			int framefinished = 0;
-			int nres = avcodec_decode_video2(m_pCodecCtx,m_pFrame,&framefinished,&vpacket);
-			av_free_packet(&vpacket); 
-			
-	check_decode_process : 
-			if(nres < 0 )
-			{
-				JANUS_LOG(LOG_ERR, "Decoder BROKEN ->> !!! \n");
-				// decoder is broken, 
-				broken++; 
-				// if 5 new frame without result, request key_frame
-				if(broken > 5 )
+				if(infos->key)
+					was_key_frame = 1; 
+				
+				if(sframe_search > 20) // FIXME : the good number 
 				{
+					JANUS_LOG(LOG_VERB, "sframe_search > 20 ...0_o \n");
+					was_key_frame = 0; 
+					sframe_search = 0; 
 					first_frame = 0; 
-					reinit_decoder = 1; 
+					goto delete_and_continue; 
 				}
-				frame_len = 0; 
-				goto delete_and_continue; 
-			}
+				if(frame_len == 0 && !infos->sbit) 
+				{
+					JANUS_LOG(LOG_VERB, "frame_len = 0 and !infos->sbit 0_o \n");
+					sframe_search ++; 
+					goto delete_and_continue; 	
+				}
+				
+				if(infos->sbit && !infos->pid)
+					frame_len = 0; 
 			
-			if((nres == frame_len) && (!framefinished) && rtp->markerbit)
-			{
-				// with some codecs of libav version, you need to give decode_video2 a null packet in order to get the frame 
-				// call decode_video2 with empty packet in respect to AV_CODEC_CAP_DELAY
-				AVPacket packet;
-				av_init_packet(&packet);
-				packet.stream_index = 0; 
-				packet.data = NULL;
-				packet.size = 0;
-				nres = avcodec_decode_video2(m_pCodecCtx,m_pFrame,&framefinished,&packet);	
-				av_free_packet(&packet); 
-				goto check_decode_process; 
-			}
+				if((vp8w*vp8h+vp8ws*vp8hs) != ((infos->vp8w*infos->vp8h+infos->vp8ws*infos->vp8hs)))
+				{
+					vp8w  = infos->vp8w;
+					vp8ws = infos->vp8ws;
+					vp8h  = infos->vp8h;
+					vp8hs = infos->vp8hs;	
+					reinit_decoder = 1; 
+					JANUS_LOG(LOG_VERB, "[POSTPROCESS] resolution has changed !!!!!!!!! %d %d\n",vp8w,vp8h);			
+				}
+				
+				memcpy(received_frame+frame_len,infos->offset,infos->len); 
+				frame_len += infos->len; 
+				
+				if(!rtp->markerbit) // incomplete frame, continue.  
+					goto delete_and_continue;
+				
+				
+				// here, the frame is complete 
+				
+				memcpy(received_frame+frame_len,"00000000000000000000000000000000",32); // add padding for ffmpeg 
+				
+				AVPacket vpacket;
+				av_init_packet(&vpacket);
+				vpacket.stream_index = 0; 
+				vpacket.data = received_frame;
+				vpacket.size = frame_len;
+				vpacket.dts = (rtp->timestamp)/90;
+				vpacket.pts = (rtp->timestamp)/90;
+				
+				if(was_key_frame)
+					vpacket.flags |= AV_PKT_FLAG_KEY; 
+				
+				was_key_frame = 0; 
+				
+				if(reinit_decoder)
+				{
+					// i'm not sure that is needed. Maybe with older version of libav. 
+					// As the resolution change trigger a keyframe, the decoder should work. 
+					// the scaler need the original resolution too line 2817
+					JANUS_LOG(LOG_ERR, "reinit_decoder !!! \n");
+					m_pCodec = avcodec_find_decoder(AV_CODEC_ID_VP8);	
+					m_pCodecCtx = avcodec_alloc_context3(m_pCodec);
+					m_pCodecCtx->codec_id = AV_CODEC_ID_VP8;
 			
-			broken = 0; 
-			
-			if(!framefinished)
-				goto delete_and_continue; 
-			
-			
-			// complete frame decoded -> rescale 
-			avpicture_fill((AVPicture*) my_frame, myFrame, PIX_FMT_RGB24, 480, 360);
-			sws_frame->format = PIX_FMT_RGB24; 
-			sws_frame->height = 480; 
-			sws_frame->width = 360; 			 
-			avpicture_fill((AVPicture*) sws_frame, compFrame, AV_PIX_FMT_YUV420P, 480, 360);
-			sws_frame->format = AV_PIX_FMT_YUV420P; 
-			sws_frame->height = 480; 
-			sws_frame->width = 360; 
-			sws_scale(myResize, (const uint8_t *const *)(m_pFrame->data), m_pFrame->linesize, 0, vp8h, my_frame->data, my_frame->linesize);
-			// JANUS_LOG(LOG_INFO,"height: %d \t width: %d \t linesize: %d \n",my_frame->height, my_frame->width, my_frame->linesize[0]);
-			// char buffer[1440 * 360];
-			sendAndGet(my_frame->data[0], my_frame->data[0]);
-			// ... here make your frame manipulation, opencv ...  
-			sws_scale(resize, (const uint8_t *const *)(my_frame->data), my_frame->linesize, 0, vp8h, sws_frame->data, sws_frame->linesize);
-			// we encode it ...
-		encode_frame : 
-			complete_frame++; 
-			AVPacket opacket;
-			av_init_packet(&opacket);
-			int decode_finished = 0,enc_finished = 0; 
-			if (o_fmt_ctx->oformat->flags & AVFMT_GLOBALHEADER) vStream->codec->flags |= CODEC_FLAG_GLOBAL_HEADER;
-			
-			
-			av_free_packet(&opacket); // weired but without that, encode_video bug/crash ! // yes, it is weired.
-			
-			decode_finished = avcodec_encode_video2(vStream->codec,&opacket,sws_frame,&enc_finished); 
-			opacket.stream_index = 0; 
+					#if LIBAVCODEC_VER_AT_LEAST(53, 21)
+						avcodec_get_context_defaults3(m_pCodecCtx, AVMEDIA_TYPE_VIDEO);
+					#else
+						avcodec_get_context_defaults2(m_pCodecCtx, AVMEDIA_TYPE_VIDEO);
+					#endif				
+					m_pCodecCtx->codec_type = AVMEDIA_TYPE_VIDEO;
+					m_pCodecCtx->time_base = (AVRational){1, 200};
+					m_pCodecCtx->width = vp8w;
+					m_pCodecCtx->height = vp8h; 
+					m_pCodecCtx->pix_fmt = AV_PIX_FMT_YUV420P;
+					m_pCodecCtx->flags |= CODEC_FLAG_GLOBAL_HEADER;
+					avcodec_open2(m_pCodecCtx,m_pCodec,0);
+					if(!m_pFrame)
+						m_pFrame = av_frame_alloc()	;
+					if(!sws_frame)
+						sws_frame = av_frame_alloc();
+					if(!my_frame)
+						my_frame = av_frame_alloc();
+						 
+					resize = sws_getContext(480,360, PIX_FMT_RGB24, 480, 360, AV_PIX_FMT_YUV420P, SWS_BICUBIC, NULL, NULL, NULL);
+					myResize = sws_getContext(vp8w,vp8h, AV_PIX_FMT_YUV420P, 480, 360, PIX_FMT_RGB24, SWS_BICUBIC, NULL, NULL, NULL); 
+					reinit_decoder = 0; 
+				}
+				
+				int framefinished = 0;
+				int nres = avcodec_decode_video2(m_pCodecCtx,m_pFrame,&framefinished,&vpacket);
+				av_free_packet(&vpacket); 
+				
+		check_decode_process : 
+				if(nres < 0 )
+				{
+					JANUS_LOG(LOG_ERR, "Decoder BROKEN ->> !!! \n");
+					// decoder is broken, 
+					broken++; 
+					// if 5 new frame without result, request key_frame
+					if(broken > 5 )
+					{
+						first_frame = 0; 
+						reinit_decoder = 1; 
+					}
+					frame_len = 0; 
+					goto delete_and_continue; 
+				}
+				
+				if((nres == frame_len) && (!framefinished) && rtp->markerbit)
+				{
+					// with some codecs of libav version, you need to give decode_video2 a null packet in order to get the frame 
+					// call decode_video2 with empty packet in respect to AV_CODEC_CAP_DELAY
+					AVPacket packet;
+					av_init_packet(&packet);
+					packet.stream_index = 0; 
+					packet.data = NULL;
+					packet.size = 0;
+					nres = avcodec_decode_video2(m_pCodecCtx,m_pFrame,&framefinished,&packet);	
+					av_free_packet(&packet); 
+					goto check_decode_process; 
+				}
+				
+				broken = 0; 
+				
+				if(!framefinished)
+					goto delete_and_continue; 
+				
+				
+				// complete frame decoded -> rescale 
+				avpicture_fill((AVPicture*) my_frame, myFrame, PIX_FMT_RGB24, 480, 360);
+				sws_frame->format = PIX_FMT_RGB24; 
+				sws_frame->height = 480; 
+				sws_frame->width = 360; 			 
+				avpicture_fill((AVPicture*) sws_frame, compFrame, AV_PIX_FMT_YUV420P, 480, 360);
+				sws_frame->format = AV_PIX_FMT_YUV420P; 
+				sws_frame->height = 480; 
+				sws_frame->width = 360; 
+				sws_scale(myResize, (const uint8_t *const *)(m_pFrame->data), m_pFrame->linesize, 0, vp8h, my_frame->data, my_frame->linesize);
+				// JANUS_LOG(LOG_INFO,"height: %d \t width: %d \t linesize: %d \n",my_frame->height, my_frame->width, my_frame->linesize[0]);
+				// char buffer[1440 * 360];
 
-			if(enc_finished)
-			{
-				/* write the compressed frame in the media file ->RTP  */
-				opacket.dts = opacket.pts = AV_NOPTS_VALUE; 
-				//	if(vStream->codec->coded_frame->key_frame) opacket.flags |= AV_PKT_FLAG_KEY; -> deprecated 
-				int write_ret = av_write_frame(o_fmt_ctx, &opacket);
-				if (write_ret < 0) 
-					JANUS_LOG(LOG_ERR,"Error writing frame to RTP\n");
-				else
-					rtp_written += opacket.size;			
+
+			 //    gettimeofday(&tval_after1, NULL);
+			 //    timersub(&tval_after1, &tval_before1, &tval_result);
+				// JANUS_LOG(LOG_ERR, "prepo time: %f\n",tval_result.tv_usec/1000.0);
+				// gettimeofday(&tval_before1,NULL);
+
+				sendAndGet(my_frame->data[0], my_frame->data[0]);
+				if(stop){
+					stop = 0;
+					reinit_decoder = 1;
+					first_frame = 0; 
+					janus_echotest_incoming_pp * userdata = (janus_echotest_incoming_pp * ) data; 
+					key_frame = 0; 
+					was_key_frame = 0; 
+					cur_seq_number = 0; 
+					complete_frame = 0;
+					break;
+				} 
+			 //    gettimeofday(&tval_after1, NULL);
+			 //    timersub(&tval_after1, &tval_before1, &tval_result);
+				// JANUS_LOG(LOG_ERR, "pro time: %f\n",tval_result.tv_usec/1000.0);
+				// gettimeofday(&tval_before1, NULL);
+
+				// ... here make your frame manipulation, opencv ...  
+				sws_scale(resize, (const uint8_t *const *)(my_frame->data), my_frame->linesize, 0, vp8h, sws_frame->data, sws_frame->linesize);
+				// we encode it ...
+			encode_frame : 
+				complete_frame++; 
+				AVPacket opacket;
+				av_init_packet(&opacket);
+				int decode_finished = 0,enc_finished = 0; 
+				if (o_fmt_ctx->oformat->flags & AVFMT_GLOBALHEADER) vStream->codec->flags |= CODEC_FLAG_GLOBAL_HEADER;
+				
+				
+				av_free_packet(&opacket); // weired but without that, encode_video bug/crash ! // yes, it is weired.
+				
+				decode_finished = avcodec_encode_video2(vStream->codec,&opacket,sws_frame,&enc_finished); 
+				opacket.stream_index = 0; 
+
+				if(enc_finished)
+				{
+					/* write the compressed frame in the media file ->RTP  */
+					opacket.dts = opacket.pts = AV_NOPTS_VALUE; 
+					//	if(vStream->codec->coded_frame->key_frame) opacket.flags |= AV_PKT_FLAG_KEY; -> deprecated 
+					int write_ret = av_write_frame(o_fmt_ctx, &opacket);
+					if (write_ret < 0) 
+						JANUS_LOG(LOG_ERR,"Error writing frame to RTP\n");
+					else
+						rtp_written += opacket.size;			
+				}
+				else if(decode_finished < 0 )
+					JANUS_LOG(LOG_ERR, "[postprocess] ENCoder BROKEN ->> !!! \n");		
+				av_free_packet(&opacket);
+			
+				frame_len = 0;
+
+			 //    gettimeofday(&tval_after1, NULL);
+			 //    timersub(&tval_after1, &tval_before1, &tval_result);
+				// JANUS_LOG(LOG_ERR, "post pro time: %f\n",tval_result.tv_usec/1000.0);
+
+				goto delete_and_continue; 
 			}
-			else if(decode_finished < 0 )
-				JANUS_LOG(LOG_ERR, "[postprocess] ENCoder BROKEN ->> !!! \n");		
-			av_free_packet(&opacket);
-		
-			frame_len = 0; 			
-			goto delete_and_continue; 
-		}		 
+			g_free(compFrame);
+			g_free(myFrame);
+			g_free(received_frame);
+			// g_list_free(userdata->data); 
+	 
+		}
+		g_free(infos);	
+		 
 	}
-	g_free(compFrame);
-	g_free(myFrame);
-	g_free(received_frame); 
-	g_free(infos); 
-
 	JANUS_LOG(LOG_ERR, "pp cls OK!\n");
 	
 	return NULL;
