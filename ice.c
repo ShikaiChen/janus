@@ -395,8 +395,9 @@ static janus_mutex old_handles_mutex;
 static gboolean janus_ice_handles_cleanup(gpointer user_data) {
 	janus_ice_handle *handle = (janus_ice_handle *) user_data;
 
-	JANUS_LOG(LOG_INFO, "Cleaning up handle %"SCNu64"...\n", handle->handle_id);
+	JANUS_LOG(LOG_ERR, "Cleaning up handle %"SCNu64"...\n", handle->handle_id);
 	janus_ice_free(handle);
+	JANUS_LOG(LOG_ERR, "Cleaned up handle %"SCNu64"...\n", handle->handle_id);
 
 	return G_SOURCE_REMOVE;
 }
@@ -930,6 +931,7 @@ janus_ice_handle *janus_ice_handle_create(void *gateway_session) {
 		session->ice_handles = g_hash_table_new_full(g_int64_hash, g_int64_equal, (GDestroyNotify)g_free, NULL);
 	g_hash_table_insert(session->ice_handles, janus_uint64_dup(handle->handle_id), handle);
 	janus_mutex_unlock(&session->mutex);
+	JANUS_LOG(LOG_INFO, "Created new handle in session %"SCNu64": %"SCNu64"\n", session->session_id, handle_id);
 
 	return handle;
 }
@@ -1062,6 +1064,7 @@ gint janus_ice_handle_destroy(void *gateway_session, guint64 handle_id) {
 	janus_mutex_lock(&old_handles_mutex);
 	g_hash_table_insert(old_handles, janus_uint64_dup(handle->handle_id), handle);
 	janus_mutex_unlock(&old_handles_mutex);
+	JANUS_LOG(LOG_INFO, "Detached handle from %s\n", plugin_t->get_name());
 	return error;
 }
 
@@ -1085,6 +1088,7 @@ void janus_ice_free(janus_ice_handle *handle) {
 	janus_ice_webrtc_free(handle);
 	JANUS_LOG(LOG_INFO, "[%"SCNu64"] Handle and related resources freed\n", handle->handle_id);
 	g_free(handle);
+	JANUS_LOG(LOG_INFO, "[%"SCNu64"] Handle and related resources really freed\n", handle->handle_id);
 	handle = NULL;
 }
 
@@ -2565,6 +2569,8 @@ int janus_ice_setup_local(janus_ice_handle *handle, int offer, int audio, int vi
 		"ice-tcp", janus_ice_tcp_enabled ? TRUE : FALSE,
 #endif
 		NULL);
+	JANUS_LOG(LOG_INFO, "[%"SCNu64"] Created ICE agent (ICE %s mode, %s)\n", handle->handle_id,
+		janus_ice_lite_enabled ? "Lite" : "Full", handle->controlling ? "controlling" : "controlled");
 	handle->agent_created = janus_get_monotonic_time();
 	/* Any STUN server to use? */
 	if(janus_stun_server != NULL && janus_stun_port > 0) {
@@ -3718,4 +3724,5 @@ void janus_ice_dtls_handshake_done(janus_ice_handle *handle, janus_ice_component
 	/* Send the event */
 	JANUS_LOG(LOG_VERB, "[%"SCNu64"] Sending event to transport...\n", handle->handle_id);
 	janus_session_notify_event(session->session_id, event);
+	JANUS_LOG(LOG_INFO, "[%"SCNu64"] The DTLS handshake really completed\n", handle->handle_id);
 }

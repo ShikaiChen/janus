@@ -331,14 +331,18 @@ void *janus_echotest_watchdog(void *data) {
 	JANUS_LOG(LOG_INFO, "EchoTest watchdog started\n");
 	gint64 now = 0;
 	while(g_atomic_int_get(&initialized) && !g_atomic_int_get(&stopping)) {
+		// JANUS_LOG(LOG_ERR, "watchdog first sleep\n");
 		g_usleep(500000);
+		// JANUS_LOG(LOG_ERR, "watchdog getting sessions mutex\n");
 		janus_mutex_lock(&sessions_mutex);
+		// JANUS_LOG(LOG_ERR, "watchdog got sessions mutex\n");
 		/* Iterate on all the sessions */
-		now = janus_get_real_time();
+		now = janus_get_monotonic_time();
 		if(old_sessions != NULL) {
 			GList *sl = old_sessions;
-			JANUS_LOG(LOG_HUGE, "Checking %d old EchoTest sessions...\n", g_list_length(old_sessions));
+			// JANUS_LOG(LOG_ERR, "Checking %d old EchoTest sessions...\n", g_list_length(old_sessions));
 			while(sl) {
+				// JANUS_LOG(LOG_ERR, "watchdog running on sessions\n");
 				janus_echotest_session *session = (janus_echotest_session *)sl->data;
 				if(!session) {
 					sl = sl->next;
@@ -346,20 +350,24 @@ void *janus_echotest_watchdog(void *data) {
 				}
 				if(now-session->destroyed >= 5*G_USEC_PER_SEC) {
 					/* We're lazy and actually get rid of the stuff only after a few seconds */
-					JANUS_LOG(LOG_VERB, "Freeing old EchoTest session\n");
+					// JANUS_LOG(LOG_ERR, "Freeing old EchoTest session\n");
 					GList *rm = sl->next;
 					old_sessions = g_list_delete_link(old_sessions, sl);
 					sl = rm;
 					session->handle = NULL;
 					g_free(session);
 					session = NULL;
+					// JANUS_LOG(LOG_ERR, "Freed old EchoTest session\n");
 					continue;
 				}
 				sl = sl->next;
 			}
 		}
+		// JANUS_LOG(LOG_ERR, "watchdog releasing sessions mutex\n");
 		janus_mutex_unlock(&sessions_mutex);
+		// JANUS_LOG(LOG_ERR, "watchdog released sessions mutex\n");
 		g_usleep(500000);
+		// JANUS_LOG(LOG_ERR, "watchdog second sleep\n");
 	}
 	JANUS_LOG(LOG_INFO, "EchoTest watchdog stopped\n");
 	return NULL;
@@ -439,10 +447,11 @@ void janus_echotest_destroy(void) {
 
 	/* FIXME We should destroy the sessions cleanly */
 
-	g_atomic_int_set(&pp_data->alive, 0);
-	g_list_free(&pp_data->data);
-	g_free(pp_data);
+	
 	janus_mutex_lock(&sessions_mutex);
+	g_atomic_int_set(&pp_data->alive, 0);
+	g_list_free(pp_data->data);
+	g_free(pp_data);
 	g_hash_table_destroy(sessions);
 	janus_mutex_unlock(&sessions_mutex);
 	g_async_queue_unref(messages);
@@ -500,10 +509,19 @@ void janus_echotest_create_session(janus_plugin_session *handle, int *error) {
 	session->has_data = FALSE;
 	session->audio_active = TRUE;
 	session->video_active = TRUE;
+
 	janus_mutex_init(&session->rec_mutex);
 	
 	session->bitrate = 0;	/* No limit */
 	session->destroyed = 0;
+	
+	
+	g_atomic_int_set(&session->hangingup, 0);
+	handle->plugin_handle = session;
+	JANUS_LOG(LOG_ERR, "janus_echotest_create_session getting sessions_mutex!\n");
+	janus_mutex_lock(&sessions_mutex);
+	JANUS_LOG(LOG_ERR, "janus_echotest_create_session got sessions_mutex!\n");
+
 	janus_mutex_lock(&pp_mutex);
 	if(g_atomic_int_get(&pp_free)) 
 		{
@@ -513,13 +531,11 @@ void janus_echotest_create_session(janus_plugin_session *handle, int *error) {
 		}
 	JANUS_LOG(LOG_ERR, "pp get OK!\n");
 	janus_mutex_unlock(&pp_mutex);
-	
-	g_atomic_int_set(&session->hangingup, 0);
-	handle->plugin_handle = session;
-	janus_mutex_lock(&sessions_mutex);
+
 	g_hash_table_insert(sessions, handle, session);
+	JANUS_LOG(LOG_ERR, "janus_echotest_create_session releasing sessions_mutex!\n");
 	janus_mutex_unlock(&sessions_mutex);
-	JANUS_LOG(LOG_ERR, "ss get OK!\n");
+	JANUS_LOG(LOG_ERR, "janus_echotest_create_session released sessions_mutex!\n");
 	return;
 }
 
@@ -534,26 +550,28 @@ void janus_echotest_destroy_session(janus_plugin_session *handle, int *error) {
 		*error = -2;
 		return;
 	}
-	JANUS_LOG(LOG_VERB, "Removing Echo Test session...\n");
+	JANUS_LOG(LOG_ERR, "janus_echotest_destroy_session getting sessions_mutex!\n");
 	janus_mutex_lock(&sessions_mutex);
-
+	JANUS_LOG(LOG_ERR, "janus_echotest_destroy_session got sessions_mutex!\n");
 	janus_mutex_lock(&pp_mutex);
+	JANUS_LOG(LOG_ERR, "janus_echotest_destroy_session got pp_mutex!\n");
 	if(g_atomic_int_get(&session->pp_access)) g_atomic_int_set(&pp_free,1);
-	g_list_free(&pp_data->data); 
+	g_list_free(pp_data->data); 
 	pp_data->data = NULL; 
 	g_atomic_int_set(&pp_data->alive,0);
 	JANUS_LOG(LOG_ERR, "pp rmv OK!\n");
 	janus_mutex_unlock(&pp_mutex);
 
 	if(!session->destroyed) {
-		session->destroyed = janus_get_real_time();
+		session->destroyed = janus_get_monotonic_time();
 		g_hash_table_remove(sessions, handle);
 		/* Cleaning up and removing the session is done in a lazy way */
 		old_sessions = g_list_append(old_sessions, session);
 	}
 
-	
+	JANUS_LOG(LOG_ERR, "janus_echotest_destroy_session releasing sessions_mutex!\n");
 	janus_mutex_unlock(&sessions_mutex);
+	JANUS_LOG(LOG_ERR, "janus_echotest_destroy_session released sessions_mutex!\n");
 	return;
 }
 
@@ -662,6 +680,8 @@ void janus_echotest_incoming_rtp(janus_plugin_session *handle, int video, char *
 				rtp_packet->data = g_malloc0(len); 
 				memcpy(rtp_packet->data,buf,len); 
 				entry->data = g_list_append(entry->data,rtp_packet); 
+
+
 				// Fixme g_list_append will enumerate all member of the list in order to add the item at the end -> we should save the last item somewhere and use 
 				// the g_list_insert instead of append. 		 
 			}
@@ -1008,10 +1028,10 @@ static void *janus_echotest_handler(void *data) {
 			}
 			/* How long will the gateway take to push the event? */
 			g_atomic_int_set(&session->hangingup, 0);
-			gint64 start = janus_get_real_time();
+			gint64 start = janus_get_monotonic_time();
 			int res = gateway->push_event(msg->handle, &janus_echotest_plugin, msg->transaction, event_text, type, sdp);
 			JANUS_LOG(LOG_VERB, "  >> Pushing event: %d (took %"SCNu64" us)\n",
-				res, janus_get_real_time()-start);
+				res, janus_get_monotonic_time()-start);
 			g_free(sdp);
 		}
 		g_free(event_text);
@@ -1232,7 +1252,7 @@ static void * janus_echotest_postprocess(void * data)
 	
 	vStream->codec->codec_id = AV_CODEC_ID_VP8;
 	vStream->codec->codec_type = AVMEDIA_TYPE_VIDEO;
-	vStream->codec->time_base = (AVRational){1, 200};
+	vStream->codec->time_base = (AVRational){1, 27};
 	vStream->codec->width = 480;
 	vStream->codec->height = 360;
 	vStream->codec->pix_fmt = AV_PIX_FMT_YUV420P;
@@ -1305,13 +1325,15 @@ static void * janus_echotest_postprocess(void * data)
 	    {
 	    	close(sockfd1);
 	        JANUS_LOG(LOG_ERR,"ERROR ON CONNECTING 1!\n");
-	        return;
+	        g_usleep(5000000);
+	        continue;
 	    }
 	    if (connect(sockfd2,(struct sockaddr *) &serv_addr2,sizeof(serv_addr2)) < 0) 
 	    {
 	    	close(sockfd2);
 	        JANUS_LOG(LOG_ERR,"ERROR ON CONNECTING 2!\n");
-	        return;
+	        g_usleep(5000000);
+	        continue;
 	    }
 	    
 	    //end socket
@@ -1321,7 +1343,7 @@ static void * janus_echotest_postprocess(void * data)
 			// gettimeofday(&tval_before, NULL);
 			if(userdata->alive == 0){
 				tmp = NULL;
-				usleep(50000);
+				reinit_decoder = 1;
 				continue;
 			}
 			// janus_mutex_lock(&userdata->mutex); 
@@ -1334,7 +1356,8 @@ static void * janus_echotest_postprocess(void * data)
 				waiting++; 
 				continue; 
 			}
-			
+
+
 			if(first_frame && tmp) goto process_frame; 
 			
 			if(!tmp && (key_search > 120) )
@@ -1540,7 +1563,7 @@ static void * janus_echotest_postprocess(void * data)
 						avcodec_get_context_defaults2(m_pCodecCtx, AVMEDIA_TYPE_VIDEO);
 					#endif				
 					m_pCodecCtx->codec_type = AVMEDIA_TYPE_VIDEO;
-					m_pCodecCtx->time_base = (AVRational){1, 200};
+					m_pCodecCtx->time_base = (AVRational){1, 27};
 					m_pCodecCtx->width = vp8w;
 					m_pCodecCtx->height = vp8h; 
 					m_pCodecCtx->pix_fmt = AV_PIX_FMT_YUV420P;
