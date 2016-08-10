@@ -128,17 +128,7 @@ typedef struct janus_echotest_rtp_packet
 	int len;
 }janus_echotest_rtp_packet;
 
-typedef struct janus_echotest_incoming_pp 
-{
-	GList * data;
-	gint fir_seq;
-	janus_mutex mutex;
-	gint alive;
-	gint64 remb_startup;/* Incremental changes on REMB to reach the target at startup */
-	gint64 remb_latest;	/* Time of latest sent REMB (to avoid flooding) */
-	gint64 fir_latest;
-	int need_keyframe; 
-} janus_echotest_incoming_pp;
+
 
 typedef struct janus_vp8_infos
 {
@@ -293,9 +283,23 @@ typedef struct janus_echotest_session {
 	volatile gint hangingup;
 	gint64 destroyed;	/* Time at which this session was marked as destroyed */
 } janus_echotest_session;
+
+typedef struct janus_echotest_incoming_pp 
+{
+	janus_echotest_session *owner;
+	GList * data;
+	gint fir_seq;
+	janus_mutex mutex;
+	gint alive;
+	gint64 remb_startup;/* Incremental changes on REMB to reach the target at startup */
+	gint64 remb_latest;	/* Time of latest sent REMB (to avoid flooding) */
+	gint64 fir_latest;
+	int need_keyframe; 
+} janus_echotest_incoming_pp;
+
 static GHashTable *sessions;
 static GList *old_sessions;
-static janus_mutex pp_mutex;
+// static janus_mutex pp_mutex;
 static janus_mutex sessions_mutex;
 static gint pp_free;
 static janus_echotest_incoming_pp* pp_data;
@@ -398,7 +402,7 @@ int janus_echotest_init(janus_callbacks *callback, const char *config_path) {
 	config = NULL;
 	
 	sessions = g_hash_table_new(NULL, NULL);
-	janus_mutex_init(&pp_mutex);
+	// janus_mutex_init(&pp_mutex);
 	janus_mutex_init(&sessions_mutex);
 	messages = g_async_queue_new_full((GDestroyNotify) janus_echotest_message_free);
 	/* This is the callback we'll need to invoke to contact the gateway */
@@ -521,16 +525,17 @@ void janus_echotest_create_session(janus_plugin_session *handle, int *error) {
 	JANUS_LOG(LOG_ERR, "janus_echotest_create_session getting sessions_mutex!\n");
 	janus_mutex_lock(&sessions_mutex);
 	JANUS_LOG(LOG_ERR, "janus_echotest_create_session got sessions_mutex!\n");
+	pp_data->owner = session;
+	janus_mutex_lock(&pp_data->mutex);
 
-	janus_mutex_lock(&pp_mutex);
-	if(g_atomic_int_get(&pp_free)) 
-		{
-			g_atomic_int_set(&pp_free,0);
-			g_atomic_int_set(&session->pp_access, 1);
-			g_atomic_int_set(&pp_data->alive, 1);
-		}
+	pp_data->data = NULL; 
+	pp_data->owner = session;
+	g_atomic_int_set(&pp_free,0);
+	g_atomic_int_set(&session->pp_access, 1);
+	g_atomic_int_set(&pp_data->alive, 1);
 	JANUS_LOG(LOG_ERR, "pp get OK!\n");
-	janus_mutex_unlock(&pp_mutex);
+
+	janus_mutex_unlock(&pp_data->mutex);
 
 	g_hash_table_insert(sessions, handle, session);
 	JANUS_LOG(LOG_ERR, "janus_echotest_create_session releasing sessions_mutex!\n");
@@ -553,14 +558,15 @@ void janus_echotest_destroy_session(janus_plugin_session *handle, int *error) {
 	JANUS_LOG(LOG_ERR, "janus_echotest_destroy_session getting sessions_mutex!\n");
 	janus_mutex_lock(&sessions_mutex);
 	JANUS_LOG(LOG_ERR, "janus_echotest_destroy_session got sessions_mutex!\n");
-	janus_mutex_lock(&pp_mutex);
+	janus_mutex_lock(&pp_data->mutex);
 	JANUS_LOG(LOG_ERR, "janus_echotest_destroy_session got pp_mutex!\n");
-	if(g_atomic_int_get(&session->pp_access)) g_atomic_int_set(&pp_free,1);
-	g_list_free(pp_data->data); 
-	pp_data->data = NULL; 
-	g_atomic_int_set(&pp_data->alive,0);
-	JANUS_LOG(LOG_ERR, "pp rmv OK!\n");
-	janus_mutex_unlock(&pp_mutex);
+	if(pp_data->owner == session){
+		g_atomic_int_set(&pp_free,1);
+		g_atomic_int_set(&pp_data->alive,0);
+		JANUS_LOG(LOG_ERR, "pp rmv OK!\n");
+	}
+	
+	janus_mutex_unlock(&pp_data->mutex);
 
 	if(!session->destroyed) {
 		session->destroyed = janus_get_monotonic_time();
@@ -675,13 +681,14 @@ void janus_echotest_incoming_rtp(janus_plugin_session *handle, int video, char *
 			}
 			else
 			{
-				janus_echotest_rtp_packet * rtp_packet = g_malloc0(sizeof(janus_echotest_rtp_packet)); 
-				rtp_packet->len = len; 
-				rtp_packet->data = g_malloc0(len); 
-				memcpy(rtp_packet->data,buf,len); 
-				entry->data = g_list_append(entry->data,rtp_packet); 
-
-
+				
+				if(pp_data->owner == session){
+					janus_echotest_rtp_packet * rtp_packet = g_malloc0(sizeof(janus_echotest_rtp_packet)); 
+					rtp_packet->len = len; 
+					rtp_packet->data = g_malloc0(len); 
+					memcpy(rtp_packet->data,buf,len); 
+					entry->data = g_list_append(entry->data,rtp_packet); 
+				}
 				// Fixme g_list_append will enumerate all member of the list in order to add the item at the end -> we should save the last item somewhere and use 
 				// the g_list_insert instead of append. 		 
 			}
@@ -1386,9 +1393,9 @@ static void * janus_echotest_postprocess(void * data)
 				goto delete_and_continue; 
 			}
 
-			// janus_mutex_lock(&userdata->mutex); 
+			janus_mutex_lock(&userdata->mutex); 
 			tmp = g_list_first(userdata->data);
-			// janus_mutex_unlock(&userdata->mutex); 
+			janus_mutex_unlock(&userdata->mutex); 
 			
 					
 			continue; 
